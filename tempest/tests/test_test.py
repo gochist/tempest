@@ -183,6 +183,61 @@ class TestRealtimeEventStream(base.TestCase):
         self.assertEqual('tempest:runtimeerror_kaboom',
                          events[1]['failure_signature'])
 
+    def test_realtime_events_expected_failure(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedExpectedFailureTest(test.BaseTestCase):
+            credentials = []
+
+            @unittest.expectedFailure
+            def runTest(self):
+                self.fail('known bug')
+
+        suite = unittest.TestSuite((EventedExpectedFailureTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        self.assertEqual('test_expected_failure', events[1]['event_type'])
+        self.assertEqual('expected_failure', events[1]['status'])
+        self.assertIn('details', events[1])
+
+    def test_realtime_events_unexpected_success(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedUnexpectedSuccessTest(test.BaseTestCase):
+            credentials = []
+
+            @unittest.expectedFailure
+            def runTest(self):
+                return None
+
+        suite = unittest.TestSuite((EventedUnexpectedSuccessTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        self.assertEqual('test_unexpected_success', events[1]['event_type'])
+        self.assertEqual('unexpected_success', events[1]['status'])
+
 
 class TestValidationResources(base.TestCase):
 

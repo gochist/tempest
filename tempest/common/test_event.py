@@ -16,6 +16,7 @@ import atexit
 import base64
 from datetime import datetime
 from datetime import timezone
+import inspect
 import json
 import os
 import queue
@@ -239,7 +240,7 @@ class AsyncEventEmitter:
                 LOG.exception('Failed to POST Tempest test event to OpenSearch %s',
                               self.opensearch_url)
 
-        if not self.file_path and not self.url:
+        if not self.file_path and not self.url and not self.opensearch_url:
             print(payload, flush=True)
 
     def _headers(self, content_type):
@@ -268,6 +269,27 @@ class EventStreamResultProxy:
 
     def __getattr__(self, name):
         return getattr(self._result, name)
+
+    def _call_result_method(self, name, test, err=None, reason=None,
+                            details=None):
+        method = getattr(self._result, name)
+        params = inspect.signature(method).parameters
+        kwargs = {}
+        if 'err' in params and err is not None:
+            kwargs['err'] = err
+        if 'reason' in params and reason is not None:
+            kwargs['reason'] = reason
+        if 'details' in params and details is not None:
+            kwargs['details'] = details
+
+        if kwargs:
+            return method(test, **kwargs)
+
+        if err is not None:
+            return method(test, err)
+        if reason is not None:
+            return method(test, reason)
+        return method(test)
 
     def startTest(self, test):
         test_id = _safe_test_id(test)
@@ -303,7 +325,7 @@ class EventStreamResultProxy:
             'test_id': _safe_test_id(test),
             'status': 'success',
         })
-        return self._result.addSuccess(test, details=details)
+        return self._call_result_method('addSuccess', test, details=details)
 
     def addError(self, test, err=None, details=None):
         test_id = _safe_test_id(test)
@@ -320,7 +342,8 @@ class EventStreamResultProxy:
                 test_id, error_message, primary_service=primary_service),
             'details': _extract_details(details),
         })
-        return self._result.addError(test, err=err, details=details)
+        return self._call_result_method('addError', test, err=err,
+                                        details=details)
 
     def addFailure(self, test, err=None, details=None):
         test_id = _safe_test_id(test)
@@ -337,7 +360,8 @@ class EventStreamResultProxy:
                 test_id, error_message, primary_service=primary_service),
             'details': _extract_details(details),
         })
-        return self._result.addFailure(test, err=err, details=details)
+        return self._call_result_method('addFailure', test, err=err,
+                                        details=details)
 
     def addSkip(self, test, reason=None, details=None):
         extracted_details = _extract_details(details)
@@ -348,7 +372,8 @@ class EventStreamResultProxy:
             'skip_reason': reason or (extracted_details or {}).get('reason'),
             'details': extracted_details,
         })
-        return self._result.addSkip(test, reason=reason, details=details)
+        return self._call_result_method('addSkip', test, reason=reason,
+                                        details=details)
 
     def addExpectedFailure(self, test, err=None, details=None):
         self._emitter.emit({
@@ -358,7 +383,8 @@ class EventStreamResultProxy:
             'error_message': _extract_error_message(err=err, details=details),
             'details': _extract_details(details),
         })
-        return self._result.addExpectedFailure(test, err=err, details=details)
+        return self._call_result_method('addExpectedFailure', test, err=err,
+                                        details=details)
 
     def addUnexpectedSuccess(self, test, details=None):
         self._emitter.emit({
@@ -367,4 +393,5 @@ class EventStreamResultProxy:
             'status': 'unexpected_success',
             'details': _extract_details(details),
         })
-        return self._result.addUnexpectedSuccess(test, details=details)
+        return self._call_result_method('addUnexpectedSuccess', test,
+                                        details=details)
