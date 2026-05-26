@@ -13,6 +13,7 @@
 # under the License.
 
 import atexit
+import base64
 from datetime import datetime
 from datetime import timezone
 import json
@@ -31,6 +32,16 @@ LOG = logging.getLogger(__name__)
 
 def _utcnow():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_token(value):
+    if not value:
+        return None
+    token = ''.join(
+        char.lower() if char.isalnum() else '_'
+        for char in value.strip())
+    token = '_'.join(filter(None, token.split('_')))
+    return token[:80] if token else None
 
 
 def _safe_test_id(test):
@@ -62,6 +73,12 @@ def _extract_error_message(err=None, details=None):
 
     extracted = _extract_details(details)
     if extracted:
+        traceback_text = extracted.get('traceback')
+        if traceback_text:
+            lines = [line.strip() for line in traceback_text.splitlines()
+                     if line.strip()]
+            if lines:
+                return lines[-1]
         for key in ('traceback', 'reason', 'content', 'stderr'):
             if extracted.get(key):
                 return extracted[key]
@@ -94,6 +111,26 @@ def _guess_service(module_name):
     return None
 
 
+def _guess_layer(module_name):
+    tokens = module_name.split('.')
+    if 'scenario' in tokens:
+        return 'scenario'
+    if 'api' in tokens:
+        return 'api'
+    return None
+
+
+def _failure_signature(test_id, message, primary_service=None):
+    if not message:
+        return None
+    first_line = message.splitlines()[0].strip()
+    normalized = _normalize_token(first_line)
+    if not normalized:
+        return None
+    prefix = primary_service or _guess_service(test_id) or 'tempest'
+    return '%s:%s' % (prefix, normalized)
+
+
 class AsyncEventEmitter:
     """Emit Tempest test events asynchronously.
 
@@ -111,7 +148,16 @@ class AsyncEventEmitter:
             '1', 'true', 'yes', 'on')
         self.file_path = os.getenv('TEMPEST_EVENT_STREAM_FILE')
         self.url = os.getenv('TEMPEST_EVENT_STREAM_URL')
+        self.opensearch_url = os.getenv('TEMPEST_EVENT_OPENSEARCH_URL')
+        self.opensearch_index = os.getenv(
+            'TEMPEST_EVENT_OPENSEARCH_INDEX', 'tempest-test-event')
+        self.username = os.getenv('TEMPEST_EVENT_STREAM_USERNAME')
+        self.password = os.getenv('TEMPEST_EVENT_STREAM_PASSWORD')
         self.run_id = os.getenv('TEMPEST_EVENT_RUN_ID') or _utcnow()
+        self.job_name = os.getenv('TEMPEST_EVENT_JOB_NAME')
+        self.branch = os.getenv('TEMPEST_EVENT_BRANCH')
+        self.worker = os.getenv('TEMPEST_EVENT_WORKER')
+        self.build_url = os.getenv('TEMPEST_EVENT_BUILD_URL')
         self._queue = queue.Queue()
         self._thread = None
         self._shutdown = threading.Event()
@@ -127,6 +173,10 @@ class AsyncEventEmitter:
             return
         event.setdefault('run_id', self.run_id)
         event.setdefault('timestamp', _utcnow())
+        event.setdefault('job_name', self.job_name)
+        event.setdefault('branch', self.branch)
+        event.setdefault('worker', self.worker)
+        event.setdefault('build_url', self.build_url)
         self._queue.put(event)
 
     def close(self):
@@ -158,7 +208,7 @@ class AsyncEventEmitter:
             request = urllib.request.Request(
                 self.url,
                 data=payload.encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
+                headers=self._headers('application/json'),
                 method='POST')
             try:
                 with urllib.request.urlopen(request, timeout=1):
@@ -166,8 +216,39 @@ class AsyncEventEmitter:
             except urllib.error.URLError:
                 LOG.exception('Failed to POST Tempest test event to %s', self.url)
 
+        if self.opensearch_url:
+            action = json.dumps({
+                'index': {
+                    '_index': self.opensearch_index,
+                    '_id': '%s:%s:%s' % (
+                        event.get('run_id'),
+                        event.get('test_id'),
+                        event.get('event_type'))
+                }
+            })
+            bulk_payload = action + '\n' + payload + '\n'
+            request = urllib.request.Request(
+                self.opensearch_url.rstrip('/') + '/_bulk',
+                data=bulk_payload.encode('utf-8'),
+                headers=self._headers('application/x-ndjson'),
+                method='POST')
+            try:
+                with urllib.request.urlopen(request, timeout=1):
+                    pass
+            except urllib.error.URLError:
+                LOG.exception('Failed to POST Tempest test event to OpenSearch %s',
+                              self.opensearch_url)
+
         if not self.file_path and not self.url:
             print(payload, flush=True)
+
+    def _headers(self, content_type):
+        headers = {'Content-Type': content_type}
+        if self.username and self.password:
+            token = ('%s:%s' % (self.username, self.password)).encode('utf-8')
+            headers['Authorization'] = 'Basic ' + (
+                base64.b64encode(token).decode('ascii'))
+        return headers
 
 
 _EMITTER = AsyncEventEmitter()
@@ -190,6 +271,7 @@ class EventStreamResultProxy:
 
     def startTest(self, test):
         test_id = _safe_test_id(test)
+        primary_service = _guess_service(test.__class__.__module__)
         self._started[test_id] = datetime.now(timezone.utc)
         self._emitter.emit({
             'event_type': 'test_start',
@@ -197,7 +279,8 @@ class EventStreamResultProxy:
             'test_name': getattr(test, '_testMethodName', None),
             'test_class': test.__class__.__name__,
             'module': test.__class__.__module__,
-            'primary_service_guess': _guess_service(test.__class__.__module__),
+            'primary_service_guess': primary_service,
+            'test_layer_guess': _guess_layer(test.__class__.__module__),
         })
         return self._result.startTest(test)
 
@@ -223,21 +306,35 @@ class EventStreamResultProxy:
         return self._result.addSuccess(test, details=details)
 
     def addError(self, test, err=None, details=None):
+        test_id = _safe_test_id(test)
+        primary_service = _guess_service(test.__class__.__module__)
+        error_message = _extract_error_message(err=err, details=details)
         self._emitter.emit({
             'event_type': 'test_error',
-            'test_id': _safe_test_id(test),
+            'test_id': test_id,
             'status': 'error',
-            'error_message': _extract_error_message(err=err, details=details),
+            'primary_service_guess': primary_service,
+            'test_layer_guess': _guess_layer(test.__class__.__module__),
+            'error_message': error_message,
+            'failure_signature': _failure_signature(
+                test_id, error_message, primary_service=primary_service),
             'details': _extract_details(details),
         })
         return self._result.addError(test, err=err, details=details)
 
     def addFailure(self, test, err=None, details=None):
+        test_id = _safe_test_id(test)
+        primary_service = _guess_service(test.__class__.__module__)
+        error_message = _extract_error_message(err=err, details=details)
         self._emitter.emit({
             'event_type': 'test_failure',
-            'test_id': _safe_test_id(test),
+            'test_id': test_id,
             'status': 'failure',
-            'error_message': _extract_error_message(err=err, details=details),
+            'primary_service_guess': primary_service,
+            'test_layer_guess': _guess_layer(test.__class__.__module__),
+            'error_message': error_message,
+            'failure_signature': _failure_signature(
+                test_id, error_message, primary_service=primary_service),
             'details': _extract_details(details),
         })
         return self._result.addFailure(test, err=err, details=details)

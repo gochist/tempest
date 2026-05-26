@@ -94,6 +94,8 @@ class TestRealtimeEventStream(base.TestCase):
         self.assertEqual(
             ['test_start', 'test_success', 'test_stop'], event_types)
         self.assertEqual('run-123', events[0]['run_id'])
+        self.assertEqual(None, events[0]['test_layer_guess'])
+        self.assertEqual('tempest.tests.test_test', events[0]['module'])
         self.assertEqual('success', events[1]['status'])
 
     def test_realtime_events_failure(self):
@@ -122,6 +124,8 @@ class TestRealtimeEventStream(base.TestCase):
         self.assertEqual('test_failure', events[1]['event_type'])
         self.assertEqual('failure', events[1]['status'])
         self.assertIn('boom', events[1]['error_message'])
+        self.assertEqual('tempest:assertionerror_boom',
+                         events[1]['failure_signature'])
 
 
 class TestValidationResources(base.TestCase):
