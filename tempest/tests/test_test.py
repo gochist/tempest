@@ -127,6 +127,62 @@ class TestRealtimeEventStream(base.TestCase):
         self.assertEqual('tempest:assertionerror_boom',
                          events[1]['failure_signature'])
 
+    def test_realtime_events_skip(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedSkipTest(test.BaseTestCase):
+            credentials = []
+
+            def runTest(self):
+                self.skipTest('not today')
+
+        suite = unittest.TestSuite((EventedSkipTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        self.assertEqual('test_skip', events[1]['event_type'])
+        self.assertEqual('skip', events[1]['status'])
+        self.assertEqual('not today', events[1]['skip_reason'])
+
+    def test_realtime_events_error(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedErrorTest(test.BaseTestCase):
+            credentials = []
+
+            def runTest(self):
+                raise RuntimeError('kaboom')
+
+        suite = unittest.TestSuite((EventedErrorTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        self.assertEqual('test_error', events[1]['event_type'])
+        self.assertEqual('error', events[1]['status'])
+        self.assertIn('RuntimeError: kaboom', events[1]['error_message'])
+        self.assertEqual('tempest:runtimeerror_kaboom',
+                         events[1]['failure_signature'])
+
 
 class TestValidationResources(base.TestCase):
 

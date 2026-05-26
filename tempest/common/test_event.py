@@ -340,12 +340,13 @@ class EventStreamResultProxy:
         return self._result.addFailure(test, err=err, details=details)
 
     def addSkip(self, test, reason=None, details=None):
+        extracted_details = _extract_details(details)
         self._emitter.emit({
             'event_type': 'test_skip',
             'test_id': _safe_test_id(test),
             'status': 'skip',
-            'skip_reason': reason,
-            'details': _extract_details(details),
+            'skip_reason': reason or (extracted_details or {}).get('reason'),
+            'details': extracted_details,
         })
         return self._result.addSkip(test, reason=reason, details=details)
 
