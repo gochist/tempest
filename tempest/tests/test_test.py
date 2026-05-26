@@ -13,7 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -46,6 +48,80 @@ class LoggingTestResult(testtools.TestResult):
 
     def addError(self, test, err=None, details=None):
         self.log.append((test, err, details))
+
+
+class TestRealtimeEventStream(base.TestCase):
+
+    def setUp(self):
+        super(TestRealtimeEventStream, self).setUp()
+        self.useFixture(fake_config.ConfigFixture())
+        self.useFixture(registry_fixture.RegistryFixture())
+        self.patchobject(config, 'TempestConfigPrivate',
+                         fake_config.FakePrivate)
+
+    def _build_emitter(self, path):
+        with mock.patch.dict(os.environ, {
+            'TEMPEST_EVENT_STREAM_ENABLED': '1',
+            'TEMPEST_EVENT_STREAM_FILE': path,
+            'TEMPEST_EVENT_RUN_ID': 'run-123'
+        }, clear=False):
+            return test.test_event.AsyncEventEmitter()
+
+    def test_realtime_events_success(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedTest(test.BaseTestCase):
+            credentials = []
+
+            def runTest(self):
+                return None
+
+        suite = unittest.TestSuite((EventedTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        event_types = [event['event_type'] for event in events]
+        self.assertEqual(
+            ['test_start', 'test_success', 'test_stop'], event_types)
+        self.assertEqual('run-123', events[0]['run_id'])
+        self.assertEqual('success', events[1]['status'])
+
+    def test_realtime_events_failure(self):
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            path = stream.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        emitter = self._build_emitter(path)
+        self.addCleanup(emitter.close)
+
+        class EventedFailingTest(test.BaseTestCase):
+            credentials = []
+
+            def runTest(self):
+                self.fail('boom')
+
+        suite = unittest.TestSuite((EventedFailingTest(),))
+        with mock.patch.object(test.test_event, 'get_event_emitter',
+                               return_value=emitter):
+            suite.run(LoggingTestResult([]))
+        emitter.close()
+
+        with open(path, 'r', encoding='utf-8') as fd:
+            events = [json.loads(line) for line in fd if line.strip()]
+
+        self.assertEqual('test_failure', events[1]['event_type'])
+        self.assertEqual('failure', events[1]['status'])
+        self.assertIn('boom', events[1]['error_message'])
 
 
 class TestValidationResources(base.TestCase):

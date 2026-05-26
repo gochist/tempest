@@ -26,6 +26,7 @@ import testtools
 
 from tempest import clients
 from tempest.common import credentials_factory as credentials
+from tempest.common import test_event
 from tempest import config
 from tempest.lib.common import api_microversion_fixture
 from tempest.lib.common import fixed_network
@@ -674,6 +675,17 @@ class BaseTestCase(testtools.testcase.WithAttributes,
                                                    level=None))
         if CONF.profiler.key:
             profiler.enable(CONF.profiler.key)
+
+    def run(self, result=None):
+        if result is None:
+            result = self.defaultTestResult()
+
+        emitter = test_event.get_event_emitter()
+        if emitter.enabled and not isinstance(
+                result, test_event.EventStreamResultProxy):
+            result = test_event.EventStreamResultProxy(result, emitter)
+
+        return super(BaseTestCase, self).run(result)
 
     @property
     def credentials_provider(self):
